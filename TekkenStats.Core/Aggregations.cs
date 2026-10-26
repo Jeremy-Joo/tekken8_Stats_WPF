@@ -212,6 +212,32 @@ public static class Aggregations
         return t;
     }
 
+    /// <summary>시즌 × 매치 종류별 경기 수. 없는 조합은 0, 마지막 행은 종류별 전체 합계.</summary>
+    public static Table BuildSeasonTypeCounts(IEnumerable<MatchRecord> df)
+    {
+        var records = df.ToList();
+        var types = TypeOrder.OrderBy(x => x.Value).Select(x => x.Key)
+            .Concat(records.Select(r => r.BattleType).Distinct()
+                .Where(t => !TypeOrder.ContainsKey(t)).OrderBy(t => t, OIC)).ToList();
+        var table = new Table(new[] { "Season" }.Concat(types).Append("Games").ToArray());
+        var seasons = records.GroupBy(r => r.Season)
+            .OrderByDescending(g => g.Key.StartsWith("S", StringComparison.Ordinal)
+                && int.TryParse(g.Key.AsSpan(1), out int n) ? n : 0)
+            .ThenBy(g => g.Key, OIC);
+
+        void AddRow(string season, IEnumerable<MatchRecord> matches)
+        {
+            var counts = matches.GroupBy(r => r.BattleType).ToDictionary(g => g.Key, g => g.Count());
+            table.Add(new object?[] { season }
+                .Concat(types.Select(t => (object?)counts.GetValueOrDefault(t)))
+                .Append(counts.Values.Sum()).ToArray());
+        }
+
+        foreach (var season in seasons) AddRow(season.Key, season);
+        AddRow("ALL", records);
+        return table;
+    }
+
     /* ══════════════════════════════════════════════════════════════════
        아래 다섯은 web_game_tekken_stats_wavu(lib/tekken/aggregations.ts)에서
        옮겨온 것이다. 계산식을 바꾸지 말 것 — 웹과 같은 숫자가 나와야 한다.
