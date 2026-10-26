@@ -1,4 +1,8 @@
 using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
+using System.Net.WebSockets;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Playwright;
 
@@ -27,21 +31,27 @@ public sealed class BrowserSession : IAsyncDisposable
 
     private readonly string _profileDir;
     private readonly Action<string>? _log;
+    private readonly bool _ownBrowser;
+    private int _cdpPort = CdpPort;
+    private string DebuggingUrl => $"http://127.0.0.1:{_cdpPort}";
     private IPlaywright? _pw;
     private IBrowser? _browser;
     private Process? _chrome;
     private string _startUrl = "";
     private bool _freshLaunch;
+    private bool _started;
+    private bool _closed;
 
     public IBrowserContext Context { get; private set; } = default!;
     public IPage Page { get; private set; } = default!;
 
-    public BrowserSession(string profileDir, Action<string>? log = null)
+    public BrowserSession(string profileDir, Action<string>? log = null, bool ownBrowser = false)
     {
         _profileDir = string.IsNullOrWhiteSpace(profileDir)
             ? DefaultProfileDir
             : Environment.ExpandEnvironmentVariables(profileDir);
         _log = log;
+        _ownBrowser = ownBrowser;
     }
 
     /// <summary>예외 메시지를 사용자에게 보일 친절한 안내로 변환.</summary>
@@ -73,11 +83,11 @@ public sealed class BrowserSession : IAsyncDisposable
         return candidates.FirstOrDefault(File.Exists);
     }
 
-    private static async Task<bool> CdpReadyAsync()
+    private async Task<bool> CdpReadyAsync()
     {
         try
         {
-            using var r = await Http.GetAsync(CdpUrl + "/json/version");
+            using var r = await Http.GetAsync(DebuggingUrl + "/json/version");
             return r.IsSuccessStatusCode;
         }
         catch { return false; }
@@ -89,10 +99,19 @@ public sealed class BrowserSession : IAsyncDisposable
     /// </summary>
     public async Task StartAsync(string startUrl, CancellationToken ct = default)
     {
+        ct.ThrowIfCancellationRequested();
         _startUrl = startUrl;
         Directory.CreateDirectory(_profileDir);
 
-        if (!await CdpReadyAsync())
+        // EWGF 의 사전 접속/재실행은 이 수집기가 띄운 브라우저만 사용한다.
+        if (_ownBrowser)
+        {
+            using var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            _cdpPort = ((IPEndPoint)listener.LocalEndpoint).Port;
+        }
+
+        if (_ownBrowser || !await CdpReadyAsync())
         {
             string exe = FindBrowserExe()
                 ?? throw new InvalidOperationException("크롬/엣지 실행 파일을 찾지 못했습니다.");
@@ -104,22 +123,25 @@ public sealed class BrowserSession : IAsyncDisposable
                 UseShellExecute = false,
                 ArgumentList =
                 {
-                    $"--remote-debugging-port={CdpPort}",
+                    $"--remote-debugging-port={_cdpPort}",
                     $"--user-data-dir={_profileDir}",
                     "--no-first-run",
                     "--no-default-browser-check",
                     "--disable-blink-features=AutomationControlled",
                     "--hide-crash-restore-bubble",
                     "--disable-session-crashed-bubble",
-                    "--restore-last-session=false",
                     startUrl,
                 },
             };
             _chrome = Process.Start(psi);
+            _started = true;
             _freshLaunch = true;
+            _log?.Invoke($"[브라우저] PID={_chrome?.Id}, {DebuggingUrl}");
             for (int i = 0; i < 60; i++)
             {
                 if (await CdpReadyAsync()) break;
+                if (_chrome is { HasExited: true })
+                    throw new InvalidOperationException("수집용 브라우저가 시작 직후 종료됐습니다. 같은 브라우저 프로필을 사용 중인 창을 닫고 다시 시도해 주세요.");
                 await Task.Delay(500, ct);
             }
             if (!await CdpReadyAsync())
@@ -128,29 +150,30 @@ public sealed class BrowserSession : IAsyncDisposable
         else
         {
             _freshLaunch = false;
+            _started = true;
             _log?.Invoke("[브라우저] 이미 실행 중인 디버그 크롬에 연결");
         }
     }
 
     private static readonly string[] ChallengeMarkers =
     {
-        "just a moment", "보안 확인", "사람인지", "attention required",
+        "just a moment", "잠시만", "보안 확인", "사람인지", "attention required",
         "checking your browser", "cloudflare",
     };
 
-    /// <summary>CDP HTTP(/json/list)로 대상 호스트 페이지의 현재 title 을 읽는다(Playwright 미사용).</summary>
-    private async Task<(bool found, string title)> TryGetTargetTitleAsync(string host)
+    /// <summary>CDP HTTP(/json/list)로 요청한 URL 탭의 title 을 읽는다(Playwright 미사용).</summary>
+    private async Task<(bool found, string title)> TryGetTargetTitleAsync()
     {
         try
         {
-            using var r = await Http.GetAsync(CdpUrl + "/json/list");
+            using var r = await Http.GetAsync(DebuggingUrl + "/json/list");
             if (!r.IsSuccessStatusCode) return (false, "");
             using var doc = JsonDocument.Parse(await r.Content.ReadAsStringAsync());
             foreach (var el in doc.RootElement.EnumerateArray())
             {
                 if (!el.TryGetProperty("type", out var t) || t.GetString() != "page") continue;
                 string url = el.TryGetProperty("url", out var u) ? (u.GetString() ?? "") : "";
-                if (!url.Contains(host, StringComparison.OrdinalIgnoreCase)) continue;
+                if (!SameTargetUrl(url, _startUrl)) continue;
                 string title = el.TryGetProperty("title", out var ti) ? (ti.GetString() ?? "") : "";
                 return (true, title);
             }
@@ -169,10 +192,6 @@ public sealed class BrowserSession : IAsyncDisposable
     {
         if (!_freshLaunch) return true;
 
-        string host;
-        try { host = new Uri(_startUrl).Host; }
-        catch { host = ""; }
-
         int waited = 0;
         bool notified = false;
         int notFoundStreak = 0;
@@ -183,7 +202,7 @@ public sealed class BrowserSession : IAsyncDisposable
             if (!await CdpReadyAsync())
                 throw new InvalidOperationException("크롬 창이 닫혀 연결이 끊겼습니다. 다시 시도해 주세요.");
 
-            var (found, title) = await TryGetTargetTitleAsync(host);
+            var (found, title) = await TryGetTargetTitleAsync();
             string low = title.ToLowerInvariant();
             bool challenge = ChallengeMarkers.Any(m => low.Contains(m));
             // 통과: 대상 페이지의 title 이 비어있지 않고 챌린지 문구가 아님
@@ -222,7 +241,7 @@ public sealed class BrowserSession : IAsyncDisposable
     {
         try
         {
-            using var r = await Http.PutAsync(CdpUrl + "/json/new?" + Uri.EscapeDataString(url), null);
+            using var r = await Http.PutAsync(DebuggingUrl + "/json/new?" + Uri.EscapeDataString(url), null);
             if (!r.IsSuccessStatusCode)
                 _log?.Invoke($"[브라우저] 새 탭 열기 실패: HTTP {(int)r.StatusCode}");
         }
@@ -252,24 +271,30 @@ public sealed class BrowserSession : IAsyncDisposable
         else if (!await CdpReadyAsync())
             _log?.Invoke("[경고] CDP 포트 응답 없음 — 크롬이 닫혔을 수 있음");
         _log?.Invoke("[Playwright] CDP 연결…");
-        _browser = await _pw.Chromium.ConnectOverCDPAsync(CdpUrl);
+        _browser = await _pw.Chromium.ConnectOverCDPAsync(DebuggingUrl);
         Context = _browser.Contexts.Count > 0 ? _browser.Contexts[0] : await _browser.NewContextAsync();
 
         string host;
         try { host = new Uri(_startUrl).Host; }
         catch { host = ""; }
 
-        Page = Context.Pages.FirstOrDefault(p => SameHost(p.Url, host))
+        // 같은 사이트의 다른 플레이어 탭이 복원돼 있을 수 있다. 식별코드까지 일치하는 탭을 우선한다.
+        Page = Context.Pages.FirstOrDefault(p => SameTargetUrl(p.Url, _startUrl))
+               ?? Context.Pages.FirstOrDefault(p => SameHost(p.Url, host))
                ?? (Context.Pages.Count > 0 ? Context.Pages[0] : await Context.NewPageAsync());
 
         // 이미 떠 있던 크롬에 붙었거나(대상 URL 이 아님) 대상 페이지가 아니면 이동 + (필요 시) 통과 대기.
-        if (!_freshLaunch || !SameHost(Page.Url, host))
+        if (!_freshLaunch || !SameTargetUrl(Page.Url, _startUrl))
         {
             await Page.GotoAsync(_startUrl,
                 new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 60_000 });
-            if (await LooksLikeChallengeAsync())
-                await WaitPastCloudflarePlaywrightAsync(ct: ct);
+            if (await LooksLikeChallengeAsync() && !await WaitPastCloudflarePlaywrightAsync(ct: ct))
+                throw new InvalidOperationException("Cloudflare 보안 확인을 완료하지 못했습니다. 다시 시도해 주세요.");
         }
+
+        if (!SameTargetUrl(Page.Url, _startUrl))
+            throw new InvalidOperationException($"요청한 페이지와 열린 페이지가 다릅니다. 요청: {_startUrl}, 현재: {Page.Url}");
+        _log?.Invoke($"[대상 페이지] {Page.Url}");
     }
 
     /// <summary>드라이버 node.exe 를 직접 실행해 즉시 종료의 실제 원인(의존 DLL 부재/보안 차단 등)을 로그로 남긴다.</summary>
@@ -309,6 +334,18 @@ public sealed class BrowserSession : IAsyncDisposable
         if (string.IsNullOrEmpty(host)) return false;
         try { return new Uri(url).Host.Equals(host, StringComparison.OrdinalIgnoreCase); }
         catch { return false; }
+    }
+
+    /// <summary>호스트뿐 아니라 플레이어 경로와 조회 조건까지 일치해야 같은 수집 대상이다.</summary>
+    internal static bool SameTargetUrl(string url, string targetUrl)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var actual) ||
+            !Uri.TryCreate(targetUrl, UriKind.Absolute, out var target)) return false;
+        return actual.Scheme.Equals(target.Scheme, StringComparison.OrdinalIgnoreCase)
+               && actual.Host.Equals(target.Host, StringComparison.OrdinalIgnoreCase)
+               && actual.Port == target.Port
+               && actual.AbsolutePath.TrimEnd('/').Equals(target.AbsolutePath.TrimEnd('/'), StringComparison.Ordinal)
+               && actual.Query.Equals(target.Query, StringComparison.Ordinal);
     }
 
     /// <summary>현재 페이지가 Cloudflare 보안 확인 페이지인지 추정(Playwright 연결 후 사용).</summary>
@@ -401,27 +438,58 @@ public sealed class BrowserSession : IAsyncDisposable
         await Page.WaitForTimeoutAsync(300);
     }
 
-    public async ValueTask DisposeAsync()
+    /// <summary>쿠키/프로필을 저장하도록 정상 종료하고, 종료 완료까지 기다린다.</summary>
+    public async Task CloseBrowserAsync(CancellationToken ct = default)
     {
-        // 안전 종료: CDP 로 크롬에 정상 종료 요청 → 비정상 종료/복원 안내 방지
+        if (!_started || _closed) return;
+        ct.ThrowIfCancellationRequested();
+        if (await CdpReadyAsync())
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(TimeSpan.FromSeconds(5));
+            using var response = await Http.GetAsync(DebuggingUrl + "/json/version", timeout.Token);
+            response.EnsureSuccessStatusCode();
+            using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(timeout.Token));
+            string socketUrl = doc.RootElement.GetProperty("webSocketDebuggerUrl").GetString()
+                ?? throw new InvalidOperationException("브라우저 정상 종료 주소를 찾지 못했습니다.");
+            using var socket = new ClientWebSocket();
+            await socket.ConnectAsync(new Uri(socketUrl), timeout.Token);
+            var message = Encoding.UTF8.GetBytes("{\"id\":1,\"method\":\"Browser.close\"}");
+            await socket.SendAsync(new ArraySegment<byte>(message), WebSocketMessageType.Text, true, timeout.Token);
+        }
+
         try
         {
-            if (Page != null && Context != null)
+            if (_chrome != null)
             {
-                var cdp = await Context.NewCDPSessionAsync(Page);
-                await cdp.SendAsync("Browser.close");
+                await _chrome.WaitForExitAsync(ct).WaitAsync(TimeSpan.FromSeconds(10), ct);
+            }
+            // 프로세스 종료와 함께 다음 실행 전에 기존 연결이 사라졌는지도 확인한다.
+            for (int i = 0; i < 40; i++)
+            {
+                if (!await CdpReadyAsync())
+                {
+                    _closed = true;
+                    _log?.Invoke("[브라우저] 정상 종료 완료 (프로필 유지)");
+                    return;
+                }
+                await Task.Delay(250, ct);
             }
         }
-        catch { }
+        catch (TimeoutException ex)
+        {
+            throw new InvalidOperationException("브라우저 정상 종료를 확인하지 못했습니다. 플레이어 조회를 진행하지 않습니다.", ex);
+        }
+        throw new InvalidOperationException("브라우저 연결이 종료되지 않았습니다. 플레이어 조회를 진행하지 않습니다.");
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        try { await CloseBrowserAsync(); } catch { }
         try { if (_browser != null) await _browser.CloseAsync(); } catch { }
         _pw?.Dispose();
         if (_chrome != null)
         {
-            for (int i = 0; i < 40; i++)
-            {
-                if (_chrome.HasExited) break;
-                await Task.Delay(250);
-            }
             try { if (!_chrome.HasExited) _chrome.Kill(entireProcessTree: true); } catch { }
             _chrome.Dispose();
         }

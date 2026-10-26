@@ -44,7 +44,7 @@ public partial class MainWindow : Window
         if (txtSrcNote != null)
             txtSrcNote.Text = wavu
                 ? "wavu: 요청 한 번으로 전체 랭크전 이력을 받습니다. 브라우저 프로필은 쓰지 않습니다."
-                : "EWGF: 화면에 보이는 최근 전적만 받습니다. Cloudflare 창이 뜨면 직접 통과해 주세요.";
+                : "EWGF: 홈페이지 접속 확인 → 브라우저 종료 → 플레이어 페이지 수집. 보안 확인이 뜨면 직접 통과해 주세요.";
 
         // 캐시는 wavu 전용이다 — EWGF 는 원본을 저장하지 않는다(브라우저 HTML 이라 형태가 다르다).
         if (chkCache != null) chkCache.IsEnabled = wavu;
