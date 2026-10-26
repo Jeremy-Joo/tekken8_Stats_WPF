@@ -34,7 +34,7 @@
                              Checked="OnSourceChanged"
                              Content="wavu wank — 랭크전만. 공식 JSON API (브라우저 불필요, 빠름)"/>
                 <TextBlock x:Name="txtSrcNote" Foreground="Gray" Margin="0,6,0,0" TextWrapping="Wrap"
-                           Text="EWGF: 화면에 보이는 최근 전적만 받습니다. Cloudflare 창이 뜨면 직접 통과해 주세요."/>
+                           Text="EWGF: 홈페이지 접속 확인 → 브라우저 종료 → 플레이어 페이지 수집. 보안 확인이 뜨면 직접 통과해 주세요."/>
             </StackPanel>
         </GroupBox>
 
