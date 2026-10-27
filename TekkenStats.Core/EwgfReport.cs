@@ -30,7 +30,20 @@ public static class EwgfReport
             var typeSum = Annotate(Aggregations.SummaryBy(recs, r => r.BattleType, "battleType"), Style.Bracket);
             var seasonSum = Annotate(Aggregations.SummaryBy(recs, r => r.Season, "season", SeasonOrder), Style.Bracket);
             int nxt = ExcelWriter.PlaceTable(sTotal, 0, 6, "종류별(플레이/승률)", typeSum);
-            ExcelWriter.PlaceTable(sTotal, nxt, 6, "시즌별(플레이/승률)", seasonSum);
+            nxt = ExcelWriter.PlaceTable(sTotal, nxt, 6, "시즌별(플레이/승률)", seasonSum);
+
+            var seasonTypes = Aggregations.BuildSeasonTypeCounts(recs);
+            var seasonTypeHeaders = new Dictionary<string, string>
+            {
+                ["Season"] = "시즌", ["Ranked"] = "랭크 매치", ["Quick"] = "퀵 매치",
+                ["Player"] = "플레이어 매치", ["Group"] = "그룹 매치", ["Games"] = "합계",
+            };
+            for (int i = 0; i < seasonTypes.Columns.Count; i++)
+                if (seasonTypeHeaders.TryGetValue(seasonTypes.Columns[i], out string? label))
+                    seasonTypes.Columns[i] = label;
+            nxt = ExcelWriter.PlaceTable(sTotal, nxt, 6, "시즌별 매치 종류별 경기 수", seasonTypes);
+            ExcelWriter.PlaceTable(sTotal, nxt, 6, "시즌별 매치 종류별 승패/승률",
+                Annotate(Aggregations.BuildSeasonTypeSummary(recs), Style.Bracket));
 
             // ── by_type ──
             WriteSheet(wb, "by_type", Annotate(Aggregations.BuildByType(recs), Style.Bracket));
